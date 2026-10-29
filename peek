@@ -1,0 +1,342 @@
+#!/usr/bin/env -S python3 -I
+"""peek: a one-shot snapshot of CPU, RAM, GPU and SSD with the top culprits for each. No sudo."""
+import ctypes, ctypes.util, os, re, shutil, subprocess, sys, time, unicodedata
+from collections import defaultdict
+
+libc = ctypes.CDLL(None)
+libproc = ctypes.CDLL(ctypes.util.find_library("proc"))
+
+
+class RUsage(ctypes.Structure):
+    _fields_ = [("uuid", ctypes.c_uint8 * 16)] + [
+        (n, ctypes.c_uint64) for n in (
+            "user_time system_time pkg_idle_wkups interrupt_wkups pageins wired_size "
+            "resident_size phys_footprint proc_start_abstime proc_exit_abstime "
+            "child_user_time child_system_time child_pkg_idle_wkups child_interrupt_wkups "
+            "child_pageins child_elapsed_abstime diskio_bytesread diskio_byteswritten"
+        ).split()
+    ] + [("_pad", ctypes.c_uint64 * 40)]
+
+
+class Timebase(ctypes.Structure):
+    _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
+
+
+_tb = Timebase()
+libc.mach_timebase_info(ctypes.byref(_tb))
+TICK_NS = _tb.numer / _tb.denom
+NCPU = os.cpu_count() or 1
+
+
+def _pids():
+    n = libproc.proc_listallpids(None, 0)
+    buf = (ctypes.c_int * (n * 2))()
+    n = libproc.proc_listallpids(buf, ctypes.sizeof(buf))
+    return [p for p in buf[:n] if p > 0]
+
+
+def _path(pid):
+    buf = ctypes.create_string_buffer(4096)
+    if libproc.proc_pidpath(pid, buf, 4096) > 0:
+        return buf.value.decode(errors="replace")
+    return ""
+
+
+_APP_RE = re.compile(r"/([^/]+)\.app/")
+
+
+def app_name(pid, fallback):
+    """Group helpers under their outermost .app bundle (Chrome Helper -> Google Chrome)."""
+    path = _path(pid)
+    m = _APP_RE.search(path)
+    if m:
+        return m.group(1)
+    name = os.path.basename(path) or fallback
+    return name[len("com.apple."):] if name.startswith("com.apple.") else name
+
+
+def _rusage_all():
+    out = {}
+    for pid in _pids():
+        r = RUsage()
+        if libproc.proc_pid_rusage(pid, 4, ctypes.byref(r)) == 0:
+            out[pid] = (
+                (r.user_time + r.system_time) * TICK_NS,
+                r.phys_footprint,
+                r.diskio_bytesread,
+                r.diskio_byteswritten,
+            )
+    return out
+
+
+def _ps():
+    """pid -> (pcpu, rss_bytes, comm) for every process, including root-owned ones."""
+    out = {}
+    res = subprocess.run(["ps", "-Axo", "pid=,pcpu=,rss=,comm="], capture_output=True, text=True)
+    for line in res.stdout.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) == 4:
+            out[int(parts[0])] = (float(parts[1]), int(parts[2]) * 1024, os.path.basename(parts[3]))
+    return out
+
+
+def _host_cpu_ticks():
+    ticks = (ctypes.c_uint32 * 4)()
+    count = ctypes.c_uint32(4)
+    libc.host_statistics(libc.mach_host_self(), 3, ticks, ctypes.byref(count))
+    return list(ticks)  # user, system, idle, nice
+
+
+def _ioreg(cls):
+    return subprocess.run(["ioreg", "-r", "-d", "1", "-w", "0", "-c", cls],
+                          capture_output=True, text=True).stdout
+
+
+def _gpu_clients():
+    """pid -> (name, accumulated GPU ns)."""
+    out = {}
+    pid = None
+    for line in _ioreg("AGXDeviceUserClient").splitlines():
+        m = re.search(r'"IOUserClientCreator" = "pid (\d+), (.*)"', line)
+        if m:
+            pid, name = int(m.group(1)), m.group(2)
+            out.setdefault(pid, [name, 0])
+            continue
+        if pid is not None and '"AppUsage"' in line:
+            out[pid][1] += sum(int(x) for x in re.findall(r'"accumulatedGPUTime"=(\d+)', line))
+    return out
+
+
+def _gpu_stats():
+    txt = _ioreg("IOAccelerator")
+    def grab(key):
+        m = re.search(r'"%s"=(\d+)' % re.escape(key), txt)
+        return int(m.group(1)) if m else 0
+    return grab("Device Utilization %"), grab("In use system memory")
+
+
+def _disk_bytes():
+    txt = _ioreg("IOBlockStorageDriver")
+    r = sum(int(x) for x in re.findall(r'"Bytes \(Read\)"=(\d+)', txt))
+    w = sum(int(x) for x in re.findall(r'"Bytes \(Write\)"=(\d+)', txt))
+    return r, w
+
+
+def _memory():
+    vm = subprocess.run(["vm_stat"], capture_output=True, text=True).stdout
+    page = int(re.search(r"page size of (\d+)", vm).group(1))
+    pages = {k.strip().strip('"'): int(v.strip().rstrip("."))
+             for k, v in re.findall(r"^([^:\n]+):\s+(\d+)\.?$", vm, re.M)}
+    total = int(subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True).stdout)
+    app = (pages.get("Anonymous pages", 0) - pages.get("Pages purgeable", 0)) * page
+    wired = pages.get("Pages wired down", 0) * page
+    compressed = pages.get("Pages occupied by compressor", 0) * page
+    swap = subprocess.run(["sysctl", "-n", "vm.swapusage"], capture_output=True, text=True).stdout
+    m = re.search(r"used = ([\d.]+)M", swap)
+    level = subprocess.run(["sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
+                           capture_output=True, text=True).stdout.strip()
+    pressure = {"1": "normal", "2": "warning", "4": "critical"}.get(level, "normal")
+    return {
+        "total": total, "app": app, "wired": wired, "compressed": compressed,
+        "used": app + wired + compressed,
+        "swap": float(m.group(1)) * 1024 * 1024 if m else 0.0,
+        "pressure": pressure,
+    }
+
+
+def _top(groups, key, n=5):
+    rows = sorted(groups.items(), key=lambda kv: kv[1][key], reverse=True)
+    return [(name, g[key], g["count"]) for name, g in rows[:n] if g[key] > 0]
+
+
+def collect(interval=1.0, n=5):
+    cpu0, ru0, gpu0, disk0 = _host_cpu_ticks(), _rusage_all(), _gpu_clients(), _disk_bytes()
+    t0 = time.monotonic()
+    time.sleep(interval)
+    cpu1, ru1, gpu1, disk1 = _host_cpu_ticks(), _rusage_all(), _gpu_clients(), _disk_bytes()
+    dt = time.monotonic() - t0
+    ps = _ps()
+
+    groups = defaultdict(lambda: {"cpu": 0.0, "mem": 0, "gpu": 0.0, "disk": 0.0, "count": 0})
+    names = {}
+    ps.pop(os.getpid(), None)
+    for pid, (pcpu, rss, comm) in ps.items():
+        name = names[pid] = app_name(pid, comm)
+        g = groups[name]
+        g["count"] += 1
+        if pid in ru0 and pid in ru1:
+            a, b = ru0[pid], ru1[pid]
+            g["cpu"] += (b[0] - a[0]) / (dt * 1e9) * 100
+            g["mem"] += b[1]
+            g["disk"] += ((b[2] - a[2]) + (b[3] - a[3])) / dt
+        else:
+            g["cpu"] += pcpu
+            g["mem"] += rss
+    for pid, (comm, t) in gpu1.items():
+        prev = gpu0.get(pid, (comm, t))[1]
+        if t > prev:
+            groups[names.get(pid) or app_name(pid, comm)]["gpu"] += (t - prev) / (dt * 1e9) * 100
+
+    d = [b - a for a, b in zip(cpu0, cpu1)]
+    busy = d[0] + d[1] + d[3]
+    gpu_util, gpu_mem = _gpu_stats()
+    disk = shutil.disk_usage("/System/Volumes/Data")
+    load = os.getloadavg()
+
+    return {
+        "cpu": {"pct": 100 * busy / max(sum(d), 1), "user": 100 * (d[0] + d[3]) / max(sum(d), 1),
+                "sys": 100 * d[1] / max(sum(d), 1), "cores": NCPU, "load": load,
+                "top": _top(groups, "cpu", n)},
+        "mem": dict(_memory(), top=_top(groups, "mem", n)),
+        "gpu": {"pct": gpu_util, "mem": gpu_mem, "top": _top(groups, "gpu", n)},
+        "ssd": {"total": disk.total, "used": disk.total - disk.free, "free": disk.free,
+                "read": (disk1[0] - disk0[0]) / dt, "write": (disk1[1] - disk0[1]) / dt,
+                "top": _top(groups, "disk", n)},
+        "procs": len(ps),
+    }
+
+
+# ---------------------------------------------------------------- rendering
+
+GREEN, YELLOW, RED = (139, 212, 80), (245, 197, 66), (255, 95, 95)
+DIM, TEXT, LABEL = (92, 99, 112), (200, 204, 212), (230, 233, 239)
+ICONS = {"CPU": "🧠", "RAM": "🐏", "GPU": "🎮", "SSD": "💾"}
+EIGHTHS = " ▏▎▍▌▋▊▉█"
+COLOR = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+
+
+def fg(rgb, s, bold=False):
+    if not COLOR:
+        return s
+    return "\x1b[%s38;2;%d;%d;%dm%s\x1b[0m" % ("1;" if bold else "", *rgb, s)
+
+
+def light(value, warn, crit):
+    return RED if value >= crit else YELLOW if value >= warn else GREEN
+
+
+def bar(frac, width, rgb, track=True):
+    frac = min(max(frac, 0.0), 1.0)
+    eighths = round(frac * width * 8)
+    full, part = divmod(eighths, 8)
+    s = "█" * full + (EIGHTHS[part] if part else "")
+    pad = width - len(s)
+    return fg(rgb, s) + (fg(DIM, "░" * pad) if track else " " * pad)
+
+
+def visible_len(s):
+    # Emoji and other wide characters take two terminal cells.
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", s)
+    return sum(2 if unicodedata.east_asian_width(ch) == "W" else 1 for ch in plain)
+
+
+def fit(s, width):
+    return s if len(s) <= width else s[: width - 1] + "…"
+
+
+def human(n, suffix=""):
+    for unit in ("B", "K", "M", "G", "T"):
+        if abs(n) < 1024 or unit == "T":
+            return ("%.0f%s%s" if unit in "BK" or n >= 100 else "%.1f%s%s") % (n, unit, suffix)
+        n /= 1024
+
+
+def card(title, summary, gauge_frac, gauge_rgb, subline, rows, width):
+    """rows: [(name, count, frac, value_str, rgb)]"""
+    inner = width - 4
+    icon = ICONS[title] + " " if ICONS.get(title) else ""
+    head_l = "╭─ " + fg(LABEL, icon + title, bold=True) + " "
+    head_r = " " + fg(gauge_rgb, summary, bold=True) + " ─╮"
+    fill = width - visible_len(head_l) - visible_len(head_r)
+    lines = [fg(DIM, "╭─ ") + head_l[3:] + fg(DIM, "─" * fill) + head_r[:-3] + fg(DIM, " ─╮")]
+
+    def row(content):
+        return fg(DIM, "│ ") + content + " " * (inner - visible_len(content)) + fg(DIM, " │")
+
+    lines.append(row(bar(gauge_frac, inner, gauge_rgb)))
+    lines.append(row(fg(DIM, fit(subline, inner))))
+    val_w = max([len(r[3]) for r in rows] + [4])
+    bar_w = max(6, inner // 4)
+    name_w = inner - bar_w - val_w - 2
+    for name, count, frac, value, rgb in rows:
+        tag = " ×%d" % count if count > 1 else ""
+        label = fit(name, name_w - len(tag)) + tag if len(tag) < name_w - 4 else fit(name, name_w)
+        lines.append(row(fg(TEXT, label.ljust(name_w)) + " " + bar(frac, bar_w, rgb, track=False)
+                         + " " + fg(rgb, value.rjust(val_w))))
+    if not rows:
+        lines.append(row(fg(DIM, "nothing active")))
+    return lines
+
+
+def build_cards(d, width, n):
+    def rows(top, fmt, warn, crit):
+        # Scale against a fixed reference (or the peak, if bigger) so bar length is meaningful.
+        peak = max([v for _, v, _ in top] + [crit])
+        return [(name, c, v / peak, fmt(v), light(v, warn, crit)) for name, v, c in top]
+
+    cpu, mem, gpu, ssd = d["cpu"], d["mem"], d["gpu"], d["ssd"]
+    mem_frac = mem["used"] / mem["total"]
+    mem_rgb = {"warning": YELLOW, "critical": RED}.get(mem["pressure"], light(mem_frac * 100, 75, 90))
+    ssd_frac = ssd["used"] / ssd["total"]
+    gb = 1024 ** 3
+    return [
+        card("CPU", "%.0f%%" % cpu["pct"], cpu["pct"] / 100, light(cpu["pct"], 50, 80),
+             "user %.0f%%  sys %.0f%%  load %.1f  %d cores" % (cpu["user"], cpu["sys"], cpu["load"][0], cpu["cores"]),
+             rows(cpu["top"], lambda v: "%.0f%%" % v, 50, 100), width),
+        card("RAM", "%.1f/%.0f GB" % (mem["used"] / gb, mem["total"] / gb), mem_frac, mem_rgb,
+             "app %s  wired %s  comp %s  swap %s  %s" % (
+                 human(mem["app"]), human(mem["wired"]), human(mem["compressed"]),
+                 human(mem["swap"]), mem["pressure"]),
+             rows(mem["top"], human, 1 * gb, 4 * gb), width),
+        card("GPU", "%d%%" % gpu["pct"], gpu["pct"] / 100, light(gpu["pct"], 50, 80),
+             "memory in use %s" % human(gpu["mem"]),
+             rows(gpu["top"], lambda v: "%.1f%%" % v, 20, 50), width),
+        card("SSD", "%.0f/%.0f GB" % (ssd["used"] / 1e9, ssd["total"] / 1e9), ssd_frac, light(ssd_frac * 100, 75, 90),
+             "↓ %s  ↑ %s  free %.0f GB" % (human(ssd["read"], "/s"), human(ssd["write"], "/s"), ssd["free"] / 1e9),
+             rows(ssd["top"], lambda v: human(v, "/s"), 5 * 1024 ** 2, 50 * 1024 ** 2), width),
+    ]
+
+
+def render(d, n):
+    cols = shutil.get_terminal_size((100, 40)).columns
+    two_up = cols >= 2 * 36 + 1
+    width = min((cols - 1) // 2, 56) if two_up else min(cols, 64)
+    cards = build_cards(d, width, n)
+    height = max(len(c) for c in cards)
+    blank = fg(DIM, "│") + " " * (width - 2) + fg(DIM, "│")
+    for c in cards:
+        c[len(c):] = [blank] * (height - len(c))
+        c.append(fg(DIM, "╰" + "─" * (width - 2) + "╯"))
+    up = time.time() - int(re.search(r"sec = (\d+)", subprocess.run(
+        ["sysctl", "-n", "kern.boottime"], capture_output=True, text=True).stdout).group(1))
+    days, rem = divmod(int(up), 86400)
+    header = "  %s  %s · %s · %d procs · up %s" % (
+        fg(LABEL, "peek", bold=True), os.uname().nodename.split(".")[0], time.strftime("%H:%M:%S"),
+        d["procs"], ("%dd %dh" % (days, rem // 3600)) if days else "%dh %dm" % (rem // 3600, rem % 3600 // 60))
+    out = [fg(DIM, header) if not COLOR else header.replace("·", fg(DIM, "·"))]
+    pairs = [(cards[0], cards[1]), (cards[2], cards[3])] if two_up else [(c, None) for c in cards]
+    for left, right in pairs:
+        for i, line in enumerate(left):
+            out.append(line + (" " + right[i] if right else ""))
+    print("\n".join(out))
+
+
+def main():
+    import argparse, json
+    ap = argparse.ArgumentParser(prog="peek", description="One-shot snapshot of CPU, RAM, GPU and SSD with the top culprits.")
+    ap.add_argument("-n", type=int, default=5, help="culprits per resource (default 5)")
+    ap.add_argument("-i", "--interval", type=float, default=1.0, help="sample window in seconds (default 1)")
+    ap.add_argument("--json", action="store_true", help="print raw numbers as JSON")
+    args = ap.parse_args()
+    d = collect(args.interval, args.n)
+    if args.json:
+        print(json.dumps(d, indent=2))
+    else:
+        render(d, args.n)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
