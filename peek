@@ -1,6 +1,8 @@
 #!/usr/bin/env -S python3 -I
 """peek: a one-shot snapshot of CPU, RAM, GPU and SSD with the top culprits for each. No sudo."""
 import ctypes, ctypes.util, os, re, shutil, subprocess, sys, time, unicodedata
+
+__version__ = "0.1.0"
 from collections import defaultdict
 
 libc = ctypes.CDLL(None)
@@ -327,6 +329,7 @@ def main():
     ap.add_argument("-n", type=int, default=5, help="culprits per resource (default 5)")
     ap.add_argument("-i", "--interval", type=float, default=1.0, help="sample window in seconds (default 1)")
     ap.add_argument("--json", action="store_true", help="print raw numbers as JSON")
+    ap.add_argument("-V", "--version", action="version", version="peek " + __version__)
     args = ap.parse_args()
     d = collect(args.interval, args.n)
     if args.json:
