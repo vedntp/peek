@@ -4,24 +4,9 @@ A one-shot snapshot of what your Mac is doing right now. Type `peek` and after
 about a second you get CPU, RAM, GPU and SSD usage, each with the top five
 culprits. No TUI to quit, no sudo.
 
-```
-  peek  MacBook-Pro · 09:30:15 · 1188 procs · up 22h 30m
-╭─ 🧠 CPU ─────────────────────── 21% ─╮ ╭─ 🐏 RAM ──────────────── 25.1/32 GB ─╮
-│ ███████▏░░░░░░░░░░░░░░░░░░░░░░░░░░░░ │ │ ███████████████████████████▉░░░░░░░░ │
-│ user 14%  sys 8%  load 5.4  10 cores │ │ app 11.6G  wired 4.1G  comp 9.4G     │
-│ Safari ×12            ████████▌  66% │ │ Safari ×12            █████████ 8.6G │
-│ WindowServer          ████▊      37% │ │ Xcode ×4              ███▍      2.2G │
-│ ffmpeg                ███▉       30% │ │ Slack ×6              ███▏      2.1G │
-╰──────────────────────────────────────╯ ╰──────────────────────────────────────╯
-╭─ 🎮 GPU ─────────────────────── 25% ─╮ ╭─ 💾 SSD ──────────────── 586/995 GB ─╮
-│ █████████░░░░░░░░░░░░░░░░░░░░░░░░░░░ │ │ █████████████████████▋░░░░░░░░░░░░░░ │
-│ memory in use 858M                   │ │ ↓ 182K/s  ↑ 306K/s  free 409 GB      │
-│ WindowServer          ███▋     13.9% │ │ mds_stores                    167K/s │
-│ Safari ×12            █▌        5.7% │ │ Slack ×6                       18K/s │
-╰──────────────────────────────────────╯ ╰──────────────────────────────────────╯
-```
+![peek demo](assets/demo.gif)
 
-In a terminal the bars are coloured green, yellow or red by load.
+Bars are coloured green, yellow or red by load.
 
 ## What it shows
 
