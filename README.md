@@ -42,6 +42,12 @@ one line with `×50`.
 Requires macOS on Apple Silicon and Python 3 (no packages needed).
 
 ```sh
+brew install vedntp/tap/peek
+```
+
+Or without Homebrew:
+
+```sh
 curl -fsSL https://raw.githubusercontent.com/vedntp/peek/main/peek -o ~/.local/bin/peek
 chmod +x ~/.local/bin/peek
 ```
